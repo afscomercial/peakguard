@@ -31,14 +31,20 @@ class ForecastQuery(BaseModel):
     # We accept 'steps' for API compatibility, but we will forecast only 1 step
     steps: int = 1
     nowMs: int | None = None
+    tzOffsetMin: int | None = None
 
 
-def _now_from_ms(now_ms: int | None) -> pd.Timestamp:
+def _now_from_ms(now_ms: int | None, tz_offset_min: int | None = None) -> pd.Timestamp:
     if now_ms is not None:
-        # Interpret as browser local epoch ms
-        return pd.Timestamp.fromtimestamp(now_ms / 1000.0)
-    # Fallback to server local time
-    return pd.Timestamp.now()
+        # Treat incoming epoch ms as UTC and then shift by the browser's timezone offset (in minutes)
+        utc_ts = pd.Timestamp.utcfromtimestamp(now_ms / 1000.0)
+        if tz_offset_min is not None:
+            # Browser local time = UTC - offset minutes
+            return (utc_ts - pd.Timedelta(minutes=tz_offset_min)).tz_localize(None)
+        # If no offset provided, default to UTC to avoid depending on server timezone
+        return utc_ts.tz_localize(None)
+    # Fallback to server UTC time
+    return pd.Timestamp.utcnow()
 
 @app.on_event("startup")
 async def startup_event():
@@ -53,11 +59,11 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/api/synthetic/latest", response_class=JSONResponse)
-async def synthetic_latest(nowMs: int | None = None):
+async def synthetic_latest(nowMs: int | None = None, tzOffsetMin: int | None = None):
     # Extend by 1 hour each call to simulate IoT stream
     hist = STATE["history"]
     # Align to browser local time (hourly)
-    now_hour = _now_from_ms(nowMs).floor('H')
+    now_hour = _now_from_ms(nowMs, tzOffsetMin).floor('H')
     # Extend history up to now_hour
     while hist.index[-1] < now_hour:
         last_time = hist.index[-1]
@@ -80,7 +86,7 @@ async def synthetic_latest(nowMs: int | None = None):
 async def forecast(query: ForecastQuery):
     model, scaler = load_artifacts(MODEL_PATH, SCALER_PATH)
     hist = STATE["history"]
-    now_hour = _now_from_ms(query.nowMs).floor('H')
+    now_hour = _now_from_ms(query.nowMs, query.tzOffsetMin).floor('H')
     # Ensure history is extended to now_hour
     while hist.index[-1] < now_hour:
         last_time = hist.index[-1]

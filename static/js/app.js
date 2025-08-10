@@ -5,7 +5,8 @@ function nowMs(){ return Date.now(); }
 
 async function refreshLive(){
   try{
-    const data = await fetchJSON(`/api/synthetic/latest?nowMs=${nowMs()}`);
+    const tz = new Date().getTimezoneOffset();
+    const data = await fetchJSON(`/api/synthetic/latest?nowMs=${nowMs()}&tzOffsetMin=${tz}`);
     const list = document.getElementById('live-list');
     list.innerHTML = '';
     // Render most recent first
@@ -20,7 +21,8 @@ async function refreshLive(){
 
 async function refreshForecast(){
   try{
-    const payload = { steps: 1, nowMs: nowMs() };
+    const tz = new Date().getTimezoneOffset();
+    const payload = { steps: 1, nowMs: nowMs(), tzOffsetMin: tz };
     const data = await fetchJSON('/api/forecast', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     // Use last 24h history and the single next-hour forecast
     const histX = data.history.timestamps;
