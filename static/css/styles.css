@@ -1,0 +1,15 @@
+
+:root { --bg: #0d1117; --fg: #c9d1d9; --muted:#8b949e; --panel:#161b22; --accent:#58a6ff; }
+* { box-sizing: border-box; }
+body { margin:0; background: var(--bg); color: var(--fg); font-family: -apple-system, system-ui, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, sans-serif; }
+.container { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+h1 { font-size: 1.6rem; margin: 0 0 1rem; }
+.panel { background: var(--panel); border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+.plot { width: 100%; height: 420px; }
+ul#live-list { list-style: none; padding: 0; margin: 0; max-height: 360px; overflow-y: auto; border: 1px solid #223450; border-radius: 6px; background: #0b1220; }
+ul#live-list li { padding: .5rem .75rem; border-bottom: 1px solid #223450; }
+ul#live-list li:last-child { border-bottom: 0; }
+ul#live-list .row { display: flex; justify-content: space-between; gap: .75rem; color: var(--muted); }
+ul#live-list .row .ts { color: #c9d1d9; font-variant-numeric: tabular-nums; }
+ul#live-list .row .val { color: #8b949e; }
+@media (max-width: 640px){ .plot { height: 360px; } }

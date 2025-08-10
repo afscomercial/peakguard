@@ -1,0 +1,28 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PeakGuard Simulator</title>
+  <link rel="stylesheet" href="/static/css/styles.css" />
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>PeakGuard — IoT Simulator & Forecast</h1>
+
+    <section class="panel">
+      <h2>Last 12 hours (live)</h2>
+      <ul id="live-list"></ul>
+    </section>
+
+    <section class="panel">
+      <h2>Last 12 hours + Next 24 hours</h2>
+      <div id="forecast-plot" class="plot"></div>
+    </section>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
