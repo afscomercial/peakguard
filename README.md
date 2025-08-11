@@ -1,6 +1,8 @@
 ## PeakGuard API
 
-FastAPI service that simulates IoT energy consumption per device and serves GRU-based forecasts trained in `PeakGuard.ipynb`. The notebook is reference-only at runtime.
+FastAPI service that simulates IoT energy consumption per device and serves forecasts trained locally. There are two training options:
+- TensorFlow/Keras GRU (global model with device features) — `experiments/TrainingPipeline.ipynb`
+- H2O-3 AutoML (tabular regression with lags) — `experiments/H2OTrainingPipeline.ipynb`
 
 ### Highlights
 - Device-aware synthetic stream stored in SQLite, aligned to each device's timezone
@@ -27,7 +29,9 @@ peakguard_api/
     css/styles.css
     js/app.js
   experiments/
-    PeakGuard.ipynb    # reference only
+    PeakGuard.ipynb             # reference only
+    TrainingPipeline.ipynb      # Keras GRU training
+    H2OTrainingPipeline.ipynb   # H2O-3 AutoML training
   pyproject.toml
   README.md
 ```
@@ -84,7 +88,7 @@ Open `http://127.0.0.1:8000`.
   ```bash
   poetry run jupyter lab
   ```
-  Then open `experiments/TrainingPipeline.ipynb` and select the kernel "PeakGuard (poetry)".
+  Then open `experiments/TrainingPipeline.ipynb` and/or `experiments/H2OTrainingPipeline.ipynb` and select the kernel "PeakGuard (poetry)".
 
 - From vscode/cursor use 
 ```bash
@@ -141,5 +145,18 @@ Then Use <that_path>/bin/python as the kernel.
   docker build -t peakguard-api .
   docker run --rm -p 8000:8000 -e PORT=8000 -e DB_PATH=/app/data/peakguard.db -v $(pwd)/data:/app/data peakguard-api
   ```
+
+### H2O training (optional)
+- Install H2O locally (requires JVM):
+  ```bash
+  poetry add h2o  # or: pip install h2o
+  java -version   # verify Java is available
+  ```
+- Open and run `experiments/H2OTrainingPipeline.ipynb`:
+  - Builds device-local cyclical features, lag features (1,2,3,6,12,24,48), 24h rolling mean
+  - Trains H2O AutoML (regression) with an 80/20 time split
+  - Saves MOJO to `artifacts/versions/<ts>/h2o/model.mojo.zip` and `artifacts/latest/h2o/model.mojo.zip`
+  - Logs RMSE and a compact test-set plot in SQLite `models`/`model_results`
+- Serving note: the API currently serves the Keras model. MOJO serving would require adding an H2O scoring runtime or Java-based scoring; we can add this later if desired.
 
 

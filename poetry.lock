@@ -896,6 +896,25 @@ files = [
 ]
 
 [[package]]
+name = "h2o"
+version = "3.46.0.7"
+description = "H2O, Fast Scalable Machine Learning, for python"
+optional = false
+python-versions = "*"
+groups = ["main"]
+markers = "python_version <= \"3.11\""
+files = [
+    {file = "h2o-3.46.0.7-py2.py3-none-any.whl", hash = "sha256:58e15c5cf3e134876fd242b07e38309f68614702ec299b3c6ffbd53484b51e79"},
+]
+
+[package.dependencies]
+requests = "*"
+tabulate = "*"
+
+[package.extras]
+kerberos = ["gssapi", "pykerberos (>=1.1.8,<2.0.0)", "winkerberos (>=0.5.0)"]
+
+[[package]]
 name = "h5py"
 version = "3.14.0"
 description = "Read and write HDF5 files from Python"
@@ -3319,6 +3338,22 @@ anyio = ">=3.4.0,<5"
 full = ["httpx (>=0.22.0)", "itsdangerous", "jinja2", "python-multipart (>=0.0.7)", "pyyaml"]
 
 [[package]]
+name = "tabulate"
+version = "0.9.0"
+description = "Pretty-print tabular data"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+markers = "python_version <= \"3.11\""
+files = [
+    {file = "tabulate-0.9.0-py3-none-any.whl", hash = "sha256:024ca478df22e9340661486f85298cff5f6dcdba14f3813e8830015b9ed1948f"},
+    {file = "tabulate-0.9.0.tar.gz", hash = "sha256:0095b12bf5966de529c0feb1fa08671671b3368eec77d7ef7ab114be2c068b3c"},
+]
+
+[package.extras]
+widechars = ["wcwidth"]
+
+[[package]]
 name = "tenacity"
 version = "9.1.2"
 description = "Retry code until it succeeds"
@@ -4206,4 +4241,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.12"
-content-hash = "d13c3fd77d493d11dd06e1018172d66552f287b33bdd22d78da69d6fb8b62877"
+content-hash = "9eeea6735ab390931ccee53c008de4b3c1d2de67934e05ec72ec465ddf933f61"

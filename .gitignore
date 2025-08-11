@@ -25,6 +25,7 @@ build/
 
 # Artifacts (optional to ignore if large)
 artifacts/versions/*
+artifacts/latest/h2o/*
 
 
 # Data
