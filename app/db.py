@@ -186,6 +186,51 @@ def get_latest_model_results(conn: sqlite3.Connection) -> Optional[Dict]:
     }
 
 
+def list_model_ids(conn: sqlite3.Connection) -> List[int]:
+    cur = conn.execute("SELECT id FROM models ORDER BY id ASC")
+    return [int(r[0]) for r in cur.fetchall()]
+
+
+def upsert_model_with_id(
+    conn: sqlite3.Connection,
+    model_id: int,
+    created_at: str,
+    artifact_dir: str,
+    notes: Optional[str],
+) -> None:
+    conn.execute(
+        "INSERT INTO models(id, created_at, artifact_dir, notes) VALUES(?, ?, ?, ?)\n         ON CONFLICT(id) DO UPDATE SET created_at=excluded.created_at, artifact_dir=excluded.artifact_dir, notes=excluded.notes",
+        (model_id, created_at, artifact_dir, notes),
+    )
+
+
+def get_model_with_results(conn: sqlite3.Connection, model_id: int) -> Optional[Dict]:
+    cur = conn.execute(
+        "SELECT id, created_at, artifact_dir, notes FROM models WHERE id=?",
+        (model_id,),
+    )
+    m = cur.fetchone()
+    if not m:
+        return None
+    cur = conn.execute(
+        "SELECT loss_history, rmse_history, test_plot FROM model_results WHERE model_id=?",
+        (model_id,),
+    )
+    r = cur.fetchone()
+    loss = json.loads(r[0]) if r and r[0] else {"train": [], "val": []}
+    rmse = json.loads(r[1]) if r and r[1] else []
+    plot = json.loads(r[2]) if r and r[2] else {"y_true": [], "y_pred": []}
+    return {
+        "id": int(m[0]),
+        "created_at": m[1],
+        "artifact_dir": m[2],
+        "notes": m[3],
+        "loss_history": loss,
+        "rmse_history": rmse,
+        "test_plot": plot,
+    }
+
+
 def fetch_readings_range(
     conn: sqlite3.Connection,
     device_id: int,
