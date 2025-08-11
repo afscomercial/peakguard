@@ -111,15 +111,30 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    """Serve the HTML dashboard.
+
+    - Renders `templates/index.html` which drives all frontend calls.
+    - No side-effects; static assets are served from `/static`.
+    """
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/api/devices", response_class=JSONResponse)
 async def list_devices():
+    """List registered devices from SQLite.
+
+    Returns: [{ id, name, timezone }]
+    """
     with dbmod.get_conn() as conn:
         return dbmod.list_devices(conn)
 
 @app.get("/api/models/latest", response_class=JSONResponse)
 async def latest_model_metrics():
+    """Return the latest model training results.
+
+    Pulls the most recent row from `models` joined with `model_results` and returns
+    loss history, optional RMSE history, and a test-set plot. If no model has been
+    trained yet, returns { "message": "No trained model available yet" }.
+    """
     with dbmod.get_conn() as conn:
         res = dbmod.get_latest_model_results(conn)
         if not res:
@@ -133,6 +148,12 @@ def _get_latest_model_id(conn: sqlite3.Connection) -> int | None:
 
 @app.post("/api/admin/generate", response_class=JSONResponse)
 async def admin_generate(req: AdminGenerateRequest):
+    """Generate synthetic readings for the last N hours for a device.
+
+    - Aligns to the device-local hour. Only missing timestamps are inserted (idempotent).
+    - Useful to quickly populate recent data windows.
+    Returns: generated UTC window and row_count present after the operation.
+    """
     dev_id = req.deviceId
     hours = req.hours or 72
     if hours < 1:
@@ -158,6 +179,11 @@ async def admin_generate(req: AdminGenerateRequest):
 
 @app.get("/api/admin/models/sync", response_class=JSONResponse)
 async def admin_models_sync():
+    """Remote helper: report model IDs present in the server DB.
+
+    Used by the local sync driver to determine which models need to be pushed.
+    Returns: { server_model_ids: [ ... ] }
+    """
     """Synchronize model_results from local (artifacts + local DB) to remote DB.
     This endpoint is meant to be called on the remote server from the local machine via curl.
     It compares model IDs present in the server DB with those from a provided metrics payload
@@ -172,6 +198,11 @@ async def admin_models_sync():
 
 @app.post("/api/admin/models/push", response_class=JSONResponse)
 async def admin_models_push(payload: dict):
+    """Remote helper: upsert models and model_results from a JSON payload.
+
+    Expects { models: [ { id, created_at, artifact_dir, notes, loss_history, rmse_history, test_plot } ] }.
+    Upserts rows into `models` and `model_results`. Returns inserted/updated IDs.
+    """
     """Push missing model rows to remote DB.
     Body JSON format:
     {
@@ -210,6 +241,13 @@ async def admin_models_push(payload: dict):
 
 @app.get("/api/admin/models/sync-local-to-remote", response_class=JSONResponse)
 async def admin_models_sync_local_to_remote():
+    """Local driver: push missing model rows to the remote server.
+
+    - Reads all local `models` + `model_results` rows
+    - Queries remote `/api/admin/models/sync` to get existing IDs
+    - Pushes missing ones to remote `/api/admin/models/push`
+    Returns details about what was pushed or skipped.
+    """
     """Collect all local models + metrics and push missing rows to a remote server.
     Remote base URL is read from REMOTE_SYNC_URL env var (e.g., https://peakguard-production.up.railway.app).
     """
@@ -267,6 +305,11 @@ async def admin_models_sync_local_to_remote():
 
 @app.post("/api/admin/generate-range", response_class=JSONResponse)
 async def admin_generate_range(req: AdminGenerateRangeRequest):
+    """Generate synthetic readings for an explicit UTC range for a device.
+
+    Validates `startUtc` <= `endUtc`. Inserts missing hours only. Returns the
+    generated window and the resulting row_count.
+    """
     dev_id = req.deviceId
     try:
         start_utc = pd.to_datetime(req.startUtc)
@@ -292,6 +335,13 @@ async def admin_generate_range(req: AdminGenerateRangeRequest):
 
 @app.get("/api/admin/forecast-window", response_class=JSONResponse)
 async def admin_forecast_window(deviceId: int, fill: bool = False):
+    """Report the model's required forecast window and optionally backfill it.
+
+    - Reads the deployed model's window size (e.g., 48 hours)
+    - Computes the [start,end] UTC window aligned to the device-local hour
+    - If fill=true, generates any missing readings in that window
+    Returns window metadata, row_count, and any missing timestamps.
+    """
     """Inspect the exact window the forecast endpoint requires and optionally backfill it.
     Returns: window size, UTC start/end, row_count, missing_count, first missing timestamps.
     """
@@ -325,6 +375,11 @@ async def admin_forecast_window(deviceId: int, fill: bool = False):
 
 @app.get("/api/synthetic/latest", response_class=JSONResponse)
 async def synthetic_latest(nowMs: int | None = None, tzOffsetMin: int | None = None, deviceId: int | None = None):
+    """Return the last 24 hours of readings for a device.
+
+    - Aligns to the device-local hour and ensures the full 24h window exists (idempotent)
+    - Returns timestamps converted to device-local for display
+    """
     # Device selection defaults to 1
     dev_id = deviceId or 1
     with dbmod.get_conn() as conn:
@@ -351,6 +406,12 @@ async def synthetic_latest(nowMs: int | None = None, tzOffsetMin: int | None = N
 
 @app.post("/api/forecast", response_class=JSONResponse)
 async def forecast(query: ForecastQuery):
+    """Return last-24h history and the next-hour forecast for a device.
+
+    - Reads next-hour prediction from the `predictions` table when available
+    - If missing, computes one forecast using the deployed model, stores it, and returns it
+    - Always returns the last 24h history from `readings` for charting
+    """
     # Serve from stored predictions; fallback to on-the-fly if missing
     dev_id = query.deviceId or 1
     with dbmod.get_conn() as conn:
@@ -405,6 +466,13 @@ async def forecast(query: ForecastQuery):
 
 @app.get("/api/metrics/compare-24h", response_class=JSONResponse)
 async def compare_last_24h(deviceId: int):
+    """Compute and return last-24h metrics against stored predictions.
+
+    - Ensures readings/predictions exist for the past 24h
+    - Joins actual vs. y_pred and computes RMSE, MAPE, baseline RMSE, RMSE ratio, bias
+    - Upserts a `health_metrics` row for the device at the end of the window
+    Returns joined series and the computed metrics (with a green/red status).
+    """
     with dbmod.get_conn() as conn:
         dev = dbmod.get_device(conn, deviceId)
         if not dev:
@@ -460,6 +528,11 @@ async def compare_last_24h(deviceId: int):
 
 @app.get("/api/metrics/health", response_class=JSONResponse)
 async def latest_health(deviceId: int):
+    """Return the latest stored health metrics for a device.
+
+    - Fetches the latest `health_metrics` row for the device
+    - Adds a simple status field based on thresholds: rmse_ratio<=0.8 or mape<=0.2
+    """
     with dbmod.get_conn() as conn:
         row = dbmod.fetch_latest_health(conn, deviceId)
         if not row:
@@ -477,6 +550,12 @@ async def latest_health(deviceId: int):
 
 @app.post("/api/admin/metrics/synthetic-eval", response_class=JSONResponse)
 async def admin_synthetic_eval(deviceId: int, hours: int = 24):
+    """Backfill readings and predictions for a short window and compute metrics.
+
+    - For `hours` (default 24), ensures readings exist (synthetic) and predictions are backfilled
+    - Computes and stores an on-demand health snapshot for the end of that window
+    - Useful after deploy to produce initial health without waiting for 24h
+    """
     if hours < 1:
         return JSONResponse(status_code=400, content={"error": "hours must be >= 1"})
     with dbmod.get_conn() as conn:
