@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libgl1 \
     ca-certificates \
+    tzdata \
   && rm -rf /var/lib/apt/lists/*
 
 # Install runtime Python deps (CPU TensorFlow for Linux)
@@ -35,6 +36,15 @@ COPY static ./static
 COPY templates ./templates
 COPY artifacts ./artifacts
 COPY main.py ./main.py
+
+# Copy seed database snapshot (optional). At runtime, the app will copy this
+# to DB_PATH if no database exists yet.
+RUN mkdir -p /app/seed
+COPY data/peakguard.db /app/seed/peakguard.db
+
+# Ensure data directory for SQLite exists at a known path
+RUN mkdir -p /app/data
+ENV DB_PATH=/app/data/peakguard.db
 
 EXPOSE 8000
 

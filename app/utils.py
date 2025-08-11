@@ -137,3 +137,62 @@ def forecast_next_hours_from_hourly(hourly: pd.DataFrame, model, scaler, window_
     start_time = hourly.index[-1] + pd.Timedelta(hours=1)
     future_index = pd.date_range(start=start_time, periods=steps, freq='H')
     return pd.DataFrame({'timestamp': future_index, 'y_pred': preds})
+
+
+def _build_device_features(hourly: pd.DataFrame, device_id: int, device_tz: str) -> pd.DataFrame:
+    if hourly.empty:
+        return hourly
+    # hourly index is UTC-naive; convert to device-local naive for cyclical features
+    idx_local = pd.DatetimeIndex([pd.to_datetime(ts, utc=True).tz_convert(device_tz).tz_convert(None) for ts in hourly.index])
+    df = hourly.copy()
+    df.index = idx_local
+    df['hour'] = df.index.hour
+    df['dow'] = df.index.dayofweek
+    df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24.0)
+    df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24.0)
+    df['dow_sin'] = np.sin(2 * np.pi * df['dow'] / 7.0)
+    df['dow_cos'] = np.cos(2 * np.pi * df['dow'] / 7.0)
+    df['device_id'] = int(device_id)
+    return df[['consumption', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos', 'device_id']]
+
+
+def forecast_next_hours_general(hourly: pd.DataFrame, model, scaler, window_size: int, steps: int, device_id: int, device_tz: str):
+    # If model expects two inputs (sequence + device), use feature-based inference; else fallback to legacy
+    if hasattr(model, 'inputs') and isinstance(model.inputs, (list, tuple)) and len(model.inputs) == 2:
+        if len(hourly) < window_size:
+            raise ValueError(f"Need at least {window_size} points")
+        feats = _build_device_features(hourly, device_id, device_tz)
+        Xseq = feats[['consumption', 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos']].astype('float32').iloc[-window_size:].values
+        dev = np.array([int(device_id)], dtype='int32')
+        # Single step only for now
+        yhat_scaled = model.predict([Xseq.reshape(1, window_size, 5), dev], verbose=0).reshape(-1, 1)
+        yhat = scaler.inverse_transform(yhat_scaled).ravel()
+        start_time = hourly.index[-1] + pd.Timedelta(hours=1)
+        future_index = pd.date_range(start=start_time, periods=len(yhat), freq='H')
+        return pd.DataFrame({'timestamp': future_index, 'y_pred': yhat})
+    # Fallback to legacy one-input window scaling
+    return forecast_next_hours_from_hourly(hourly, model, scaler, window_size, steps)
+
+
+def get_model_window_size(model) -> int:
+    """Infer the expected time window length from the model input shape.
+    Falls back to 24 if not available.
+    """
+    try:
+        if hasattr(model, 'inputs') and isinstance(model.inputs, (list, tuple)) and len(model.inputs) >= 1:
+            shape = model.inputs[0].shape  # (None, timesteps, features)
+            if len(shape) >= 3 and shape[1] is not None:
+                return int(shape[1])
+        # Fallback to model.input_shape
+        if hasattr(model, 'input_shape'):
+            ish = model.input_shape
+            # Could be tuple or list for multi-input
+            if isinstance(ish, (list, tuple)):
+                first = ish[0]
+                if isinstance(first, (list, tuple)) and len(first) >= 3 and first[1] is not None:
+                    return int(first[1])
+            elif isinstance(ish, tuple) and len(ish) >= 3 and ish[1] is not None:
+                return int(ish[1])
+    except Exception:
+        pass
+    return 24

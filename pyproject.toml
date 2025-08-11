@@ -19,9 +19,16 @@ scikit-learn = "^1.5.0"
 # Apple Silicon (arm64) TensorFlow
 tensorflow-macos = "==2.15.0"
 tensorflow-metal = ">=1.1.0"
-keras = ">=3.2.0"
+# Match TF 2.15 constraint: keras >=2.15,<2.16
+keras = ">=2.15,<2.16"
 joblib = "^1.3.0"
 python-multipart = "^0.0.7"
+plotly = "^5.22.0"
+python-dateutil = "^2.9.0"
+
+[tool.poetry.group.dev.dependencies]
+jupyterlab = "^4.4.5"
+ipykernel = "^6.30.1"
 
 [build-system]
 requires = ["poetry-core"]

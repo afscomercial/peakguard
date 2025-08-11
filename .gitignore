@@ -24,7 +24,11 @@ dist/
 build/
 
 # Artifacts (optional to ignore if large)
-app/artifacts/*.h5
-app/artifacts/*.keras
-app/artifacts/*.pkl
+artifacts/versions/*
+
+
+# Data
+data/*.db-shm
+data/*.db-wal
+
 
