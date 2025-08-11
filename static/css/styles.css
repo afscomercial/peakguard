@@ -13,3 +13,31 @@ ul#live-list li { background: #0b1220; border: 1px solid #223450; border-radius:
 .row .ts { color: var(--fg); font-variant-numeric: tabular-nums; }
 .row .val { color: var(--accent); font-weight: 600; }
 @media (max-width: 640px){ .plot { height: 360px; } }
+
+.health { margin-top: .75rem; }
+/* Responsive grid using auto-fit to wrap cells based on available width */
+.health .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: .5rem;
+}
+.health .cell {
+  background:#0b1220;
+  border:1px solid #223450;
+  border-radius:6px;
+  padding:.5rem;
+}
+.health .label { font-size:.8rem; color: var(--muted); }
+.health .value {
+  font-weight:600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.health .status { font-weight:700; }
+
+/* Tweak typography on smaller screens */
+@media (max-width: 640px){
+  .health .label { font-size:.75rem; }
+  .health .value { font-size:.95rem; }
+}

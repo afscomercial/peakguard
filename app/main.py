@@ -2,6 +2,7 @@
 import os
 import asyncio
 import sqlite3
+import numpy as np
 from fastapi import FastAPI, Request
 from fastapi import UploadFile, File, Form, HTTPException
 import urllib.request
@@ -35,7 +36,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), na
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 # In-memory synthetic stream state
-STATE = {"history": None, "bg_task": None}
+STATE = {"history": None, "bg_task": None, "daily_task": None}
 
 class ForecastQuery(BaseModel):
     # We accept 'steps' for API compatibility, but we will forecast only 1 step
@@ -86,7 +87,9 @@ async def startup_event():
                 start_local = end_local - pd.Timedelta(days=60)
                 start_str = start_local.strftime('%Y-%m-%d %H:00:00')
                 periods = int(((end_local - start_local).total_seconds() // 3600) + 1)
-                synth = generate_synthetic_consumption(start=start_str, periods=periods, freq='H', seed=dev_id * 1000 + 42)
+                synth = generate_synthetic_consumption(
+                    start=start_str, periods=periods, freq='H', seed=dev_id * 1000 + 42
+                )
                 hourly = prepare_hourly_from_kaggle_like(synth)
                 # Persist as UTC
                 rows = []
@@ -103,6 +106,8 @@ async def startup_event():
         STATE["history"] = df
     # Launch background generator loop
     STATE["bg_task"] = asyncio.create_task(_generator_loop())
+    # Launch daily scheduler
+    STATE["daily_task"] = asyncio.create_task(_daily_health_scheduler())
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -120,6 +125,11 @@ async def latest_model_metrics():
         if not res:
             return {"message": "No trained model available yet"}
         return res
+
+def _get_latest_model_id(conn: sqlite3.Connection) -> int | None:
+    cur = conn.execute("SELECT id FROM models ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return int(row[0]) if row else None
 
 @app.post("/api/admin/generate", response_class=JSONResponse)
 async def admin_generate(req: AdminGenerateRequest):
@@ -341,39 +351,169 @@ async def synthetic_latest(nowMs: int | None = None, tzOffsetMin: int | None = N
 
 @app.post("/api/forecast", response_class=JSONResponse)
 async def forecast(query: ForecastQuery):
-    model, scaler = load_artifacts(MODEL_PATH, SCALER_PATH)
-    win = get_model_window_size(model)
-    # Select device (default 1) and construct last N-hour history (N = model window)
+    # Serve from stored predictions; fallback to on-the-fly if missing
     dev_id = query.deviceId or 1
     with dbmod.get_conn() as conn:
         dev = dbmod.get_device(conn, dev_id)
         if not dev:
             return JSONResponse(status_code=404, content={"error": "Device not found"})
-        # Always align to device-local clock for consistency by device
         now_device_local = dbmod.device_local_now_hour(dev["timezone"]) 
-        start_utc = dbmod.to_utc_from_device_local(now_device_local - pd.Timedelta(hours=win - 1), dev["timezone"]) 
-        end_utc = dbmod.to_utc_from_device_local(now_device_local, dev["timezone"]) 
-        # Proactively fill just the missing stamps within the model window
-        await _ensure_window_filled(conn, dev_id, dev["timezone"], start_utc, end_utc)
-        hist = dbmod.fetch_readings_range(conn, dev_id, start_utc, end_utc)
-        if hist.empty or len(hist) < win:
-            return JSONResponse(status_code=400, content={"error": f"Insufficient history for forecasting (need {win})"})
-        # Forecast next hour based on UTC-indexed series
-        pred_df = forecast_next_hours_general(hist, model, scaler, window_size=win, steps=1, device_id=dev_id, device_tz=dev["timezone"]) 
-        # Convert outputs to device-local for presentation
+        # Last 24h history for chart
+        start_hist_utc = dbmod.to_utc_from_device_local(now_device_local - pd.Timedelta(hours=23), dev["timezone"]) 
+        end_hist_utc = dbmod.to_utc_from_device_local(now_device_local, dev["timezone"]) 
+        await _ensure_window_filled(conn, dev_id, dev["timezone"], start_hist_utc, end_hist_utc)
+        hist = dbmod.fetch_readings_range(conn, dev_id, start_hist_utc, end_hist_utc)
+        # Pull stored prediction for next hour if present; otherwise compute once
+        next_utc = end_hist_utc + pd.Timedelta(hours=1)
+        pred_row = dbmod.fetch_predictions_range(conn, dev_id, next_utc, next_utc)
+        if pred_row.empty:
+            # Compute one-off and store
+            model, scaler = load_artifacts(MODEL_PATH, SCALER_PATH)
+            win = get_model_window_size(model)
+            start_win_utc = end_hist_utc - pd.Timedelta(hours=win - 1)
+            await _ensure_window_filled(conn, dev_id, dev["timezone"], start_win_utc, end_hist_utc)
+            win_hist = dbmod.fetch_readings_range(conn, dev_id, start_win_utc, end_hist_utc)
+            if not win_hist.empty and len(win_hist) >= win:
+                pred_df = forecast_next_hours_general(win_hist, model, scaler, window_size=win, steps=1, device_id=dev_id, device_tz=dev["timezone"]) 
+                y_pred = float(pred_df['y_pred'].iloc[0])
+                mid = _get_latest_model_id(conn) or 0
+                dbmod.insert_prediction(conn, dev_id, next_utc, mid, y_pred)
+                pred_ts_local = dbmod.to_device_local_from_utc(next_utc, dev["timezone"]) 
+                pred_idx_local = [pred_ts_local]
+                y_pred_list = [y_pred]
+            else:
+                return JSONResponse(status_code=400, content={"error": "Insufficient history for forecasting"})
+        else:
+            y_pred = float(pred_row['y_pred'].iloc[0])
+            pred_ts_local = dbmod.to_device_local_from_utc(next_utc, dev["timezone"]) 
+            pred_idx_local = [pred_ts_local]
+            y_pred_list = [y_pred]
+        # Convert history for presentation
         tail = hist.iloc[-24:]
         hist_idx_local = [dbmod.to_device_local_from_utc(ts, dev["timezone"]) for ts in tail.index]
-        pred_idx_local = [dbmod.to_device_local_from_utc(ts, dev["timezone"]) for ts in pred_df['timestamp']]
-    return {
+        return {
         "history": {
             "timestamps": pd.DatetimeIndex(hist_idx_local).strftime('%Y-%m-%d %H:%M:%S').tolist(),
             "consumption": tail['consumption'].round(4).tolist(),
         },
         "forecast": {
             "timestamps": pd.to_datetime(pred_idx_local).strftime('%Y-%m-%d %H:%M:%S').tolist(),
-            "y_pred": pred_df['y_pred'].round(4).tolist(),
+            "y_pred": [round(v, 4) for v in y_pred_list],
         },
-    }
+        }
+
+
+@app.get("/api/metrics/compare-24h", response_class=JSONResponse)
+async def compare_last_24h(deviceId: int):
+    with dbmod.get_conn() as conn:
+        dev = dbmod.get_device(conn, deviceId)
+        if not dev:
+            return JSONResponse(status_code=404, content={"error": "Device not found"})
+        now_loc = dbmod.device_local_now_hour(dev["timezone"]) 
+        end_utc = dbmod.to_utc_from_device_local(now_loc, dev["timezone"]) 
+        start_utc = end_utc - pd.Timedelta(hours=23)
+        await _ensure_window_filled(conn, deviceId, dev["timezone"], start_utc, end_utc)
+        await _backfill_predictions_range(conn, deviceId, dev["timezone"], start_utc, end_utc)
+        actual = dbmod.fetch_readings_range(conn, deviceId, start_utc, end_utc)
+        preds = dbmod.fetch_predictions_range(conn, deviceId, start_utc, end_utc)
+        if actual.empty or preds.empty:
+            return {"timestamps": [], "actual": [], "y_pred": [], "metrics": {}}
+        joined = actual.join(preds[["y_pred"]], how="inner")
+        if joined.empty:
+            return {"timestamps": [], "actual": [], "y_pred": [], "metrics": {}}
+        err = (joined['y_pred'] - joined['consumption']).astype(float)
+        rmse24 = float(np.sqrt(np.mean(np.square(err))))
+        mape24 = float(np.mean(np.abs(err) / np.maximum(1e-3, np.abs(joined['consumption']))))
+        # baseline
+        base_series = dbmod.fetch_readings_range(conn, deviceId, start_utc - pd.Timedelta(hours=24), end_utc - pd.Timedelta(hours=24))
+        if not base_series.empty:
+            base_join = actual.join(base_series[['consumption']].rename(columns={'consumption':'y_base'}), how='inner').dropna()
+            if not base_join.empty:
+                base_err = (base_join['y_base'] - base_join['consumption']).astype(float)
+                baseline_rmse = float(np.sqrt(np.mean(np.square(base_err))))
+            else:
+                baseline_rmse = float('nan')
+        else:
+            baseline_rmse = float('nan')
+        rmse_ratio = float(rmse24 / baseline_rmse) if baseline_rmse and not np.isnan(baseline_rmse) and baseline_rmse > 0 else float('nan')
+        bias24 = float(np.mean(err))
+        mid = _get_latest_model_id(conn) or 0
+        dbmod.upsert_health_metrics(conn, deviceId, end_utc, mid, rmse24, mape24, baseline_rmse, rmse_ratio, bias24)
+        # Determine status color with simple threshold
+        threshold_ratio = 0.8
+        status_good = (rmse_ratio <= threshold_ratio) if not np.isnan(rmse_ratio) else False
+        ts_local = [dbmod.to_device_local_from_utc(ts, dev["timezone"]) for ts in joined.index]
+        return {
+            "timestamps": pd.DatetimeIndex(ts_local).strftime('%Y-%m-%d %H:%M:%S').tolist(),
+            "actual": joined['consumption'].round(4).tolist(),
+            "y_pred": joined['y_pred'].round(4).tolist(),
+            "metrics": {
+                "rmse_24h": round(rmse24, 4),
+                "mape_24h": round(mape24, 4),
+                "baseline_rmse_24h": (None if np.isnan(baseline_rmse) else round(baseline_rmse, 4)),
+                "rmse_ratio_24h": (None if np.isnan(rmse_ratio) else round(rmse_ratio, 4)),
+                "bias_24h": round(bias24, 4),
+                "status": ("green" if status_good else "red"),
+            }
+        }
+
+
+@app.get("/api/metrics/health", response_class=JSONResponse)
+async def latest_health(deviceId: int):
+    with dbmod.get_conn() as conn:
+        row = dbmod.fetch_latest_health(conn, deviceId)
+        if not row:
+            return {"message": "No health metrics yet"}
+        ratio = row.get('rmse_ratio_24h')
+        mape = row.get('mape_24h')
+        status = "red"
+        if ratio is not None and ratio <= 0.8:
+            status = "green"
+        elif mape is not None and mape <= 0.2:
+            status = "green"
+        row['status'] = status
+        return row
+
+
+@app.post("/api/admin/metrics/synthetic-eval", response_class=JSONResponse)
+async def admin_synthetic_eval(deviceId: int, hours: int = 24):
+    if hours < 1:
+        return JSONResponse(status_code=400, content={"error": "hours must be >= 1"})
+    with dbmod.get_conn() as conn:
+        dev = dbmod.get_device(conn, deviceId)
+        if not dev:
+            return JSONResponse(status_code=404, content={"error": "Device not found"})
+        tz = dev['timezone']
+        now_loc = dbmod.device_local_now_hour(tz)
+        end_utc = dbmod.to_utc_from_device_local(now_loc, tz)
+        start_utc = end_utc - pd.Timedelta(hours=hours - 1)
+        await _ensure_window_filled(conn, deviceId, tz, start_utc, end_utc)
+        await _backfill_predictions_range(conn, deviceId, tz, start_utc, end_utc)
+        actual = dbmod.fetch_readings_range(conn, deviceId, start_utc, end_utc)
+        preds = dbmod.fetch_predictions_range(conn, deviceId, start_utc, end_utc)
+        if actual.empty or preds.empty:
+            return {"message": "Insufficient data for evaluation"}
+        joined = actual.join(preds[['y_pred']], how='inner')
+        if joined.empty:
+            return {"message": "No overlap for evaluation"}
+        err = (joined['y_pred'] - joined['consumption']).astype(float)
+        rmse = float(np.sqrt(np.mean(np.square(err))))
+        mape = float(np.mean(np.abs(err) / np.maximum(1e-3, np.abs(joined['consumption']))))
+        base_series = dbmod.fetch_readings_range(conn, deviceId, start_utc - pd.Timedelta(hours=24), end_utc - pd.Timedelta(hours=24))
+        if not base_series.empty:
+            base_join = actual.join(base_series[['consumption']].rename(columns={'consumption':'y_base'}), how='inner').dropna()
+            if not base_join.empty:
+                base_err = (base_join['y_base'] - base_join['consumption']).astype(float)
+                base_rmse = float(np.sqrt(np.mean(np.square(base_err))))
+            else:
+                base_rmse = float('nan')
+        else:
+            base_rmse = float('nan')
+        ratio = float(rmse / base_rmse) if base_rmse and not np.isnan(base_rmse) and base_rmse > 0 else float('nan')
+        bias = float(np.mean(err))
+        mid = _get_latest_model_id(conn) or 0
+        dbmod.upsert_health_metrics(conn, deviceId, end_utc, mid, rmse, mape, base_rmse, ratio, bias)
+    return {"deviceId": deviceId, "window_hours": hours, "stored": True}
 
 
 async def _generate_missing_for_device(conn: sqlite3.Connection | None, device_id: int, device_tz: str) -> None:
@@ -418,6 +558,12 @@ def _seconds_until_next_utc_hour() -> float:
     return float((next_hour - now).total_seconds())
 
 
+def _seconds_until_next_utc_day() -> float:
+    now = pd.Timestamp.utcnow()
+    next_day = (now.floor('D') + pd.Timedelta(days=1))
+    return float((next_day - now).total_seconds())
+
+
 async def _generator_loop():
     try:
         while True:
@@ -428,9 +574,125 @@ async def _generator_loop():
                 devices = dbmod.list_devices(conn)
                 for d in devices:
                     await _generate_missing_for_device(conn, d['id'], d['timezone'])
+                    # Produce next-hour forecast and store
+                    try:
+                        dev_id = d['id']
+                        tz = d['timezone']
+                        model, scaler = load_artifacts(MODEL_PATH, SCALER_PATH)
+                        win = get_model_window_size(model)
+                        now_loc = dbmod.device_local_now_hour(tz)
+                        end_utc = dbmod.to_utc_from_device_local(now_loc, tz)
+                        start_win_utc = end_utc - pd.Timedelta(hours=win - 1)
+                        await _ensure_window_filled(conn, dev_id, tz, start_win_utc, end_utc)
+                        win_hist = dbmod.fetch_readings_range(conn, dev_id, start_win_utc, end_utc)
+                        if not win_hist.empty and len(win_hist) >= win:
+                            pred_df = forecast_next_hours_general(win_hist, model, scaler, window_size=win, steps=1, device_id=dev_id, device_tz=tz)
+                            y_pred = float(pred_df['y_pred'].iloc[0])
+                            next_utc = end_utc + pd.Timedelta(hours=1)
+                            mid = _get_latest_model_id(conn) or 0
+                            dbmod.insert_prediction(conn, dev_id, next_utc, mid, y_pred)
+                            # Compute health metrics for last 24h
+                            start24 = end_utc - pd.Timedelta(hours=23)
+                            actual24 = dbmod.fetch_readings_range(conn, dev_id, start24, end_utc)
+                            preds24 = dbmod.fetch_predictions_range(conn, dev_id, start24, end_utc)
+                            if not actual24.empty and not preds24.empty:
+                                joined = actual24.join(preds24[['y_pred']], how='inner')
+                                if len(joined) >= 12:
+                                    err = (joined['y_pred'] - joined['consumption']).astype(float)
+                                    rmse24 = float(np.sqrt(np.mean(np.square(err))))
+                                    mape24 = float(np.mean(np.abs(err) / np.maximum(1e-3, np.abs(joined['consumption']))))
+                                    # Baseline: previous-day same-hour if available
+                                    baseline_series = dbmod.fetch_readings_range(conn, dev_id, start24 - pd.Timedelta(hours=24), end_utc - pd.Timedelta(hours=24))
+                                    if not baseline_series.empty:
+                                        base_join = actual24.join(baseline_series[['consumption']].rename(columns={'consumption':'y_base'}), how='inner', rsuffix='_base')
+                                        base_join = base_join.dropna()
+                                        if not base_join.empty:
+                                            base_err = (base_join['y_base'] - base_join['consumption']).astype(float)
+                                            baseline_rmse = float(np.sqrt(np.mean(np.square(base_err))))
+                                        else:
+                                            baseline_rmse = float('nan')
+                                    else:
+                                        baseline_rmse = float('nan')
+                                    rmse_ratio = float(rmse24 / baseline_rmse) if baseline_rmse and not np.isnan(baseline_rmse) and baseline_rmse > 0 else float('nan')
+                                    bias24 = float(np.mean(err))
+                                    dbmod.upsert_health_metrics(conn, dev_id, end_utc, mid, rmse24, mape24, baseline_rmse, rmse_ratio, bias24)
+                    except Exception:
+                        # Best-effort; don't crash scheduler
+                        pass
     except asyncio.CancelledError:
         # Normal shutdown path
         return
+
+
+async def _daily_health_scheduler():
+    try:
+        while True:
+            await asyncio.sleep(max(1.0, _seconds_until_next_utc_day()))
+            with dbmod.get_conn() as conn:
+                devices = dbmod.list_devices(conn)
+                for d in devices:
+                    try:
+                        dev_id = d['id']
+                        tz = d['timezone']
+                        now_loc = dbmod.device_local_now_hour(tz)
+                        end_utc = dbmod.to_utc_from_device_local(now_loc, tz)
+                        start24 = end_utc - pd.Timedelta(hours=23)
+                        await _ensure_window_filled(conn, dev_id, tz, start24, end_utc)
+                        await _backfill_predictions_range(conn, dev_id, tz, start24, end_utc)
+                        actual24 = dbmod.fetch_readings_range(conn, dev_id, start24, end_utc)
+                        preds24 = dbmod.fetch_predictions_range(conn, dev_id, start24, end_utc)
+                        if not actual24.empty and not preds24.empty:
+                            joined = actual24.join(preds24[['y_pred']], how='inner')
+                            if len(joined) >= 12:
+                                err = (joined['y_pred'] - joined['consumption']).astype(float)
+                                rmse24 = float(np.sqrt(np.mean(np.square(err))))
+                                mape24 = float(np.mean(np.abs(err) / np.maximum(1e-3, np.abs(joined['consumption']))))
+                                baseline_series = dbmod.fetch_readings_range(conn, dev_id, start24 - pd.Timedelta(hours=24), end_utc - pd.Timedelta(hours=24))
+                                if not baseline_series.empty:
+                                    base_join = actual24.join(baseline_series[['consumption']].rename(columns={'consumption':'y_base'}), how='inner', rsuffix='_base').dropna()
+                                    if not base_join.empty:
+                                        base_err = (base_join['y_base'] - base_join['consumption']).astype(float)
+                                        baseline_rmse = float(np.sqrt(np.mean(np.square(base_err))))
+                                    else:
+                                        baseline_rmse = float('nan')
+                                else:
+                                    baseline_rmse = float('nan')
+                                rmse_ratio = float(rmse24 / baseline_rmse) if baseline_rmse and not np.isnan(baseline_rmse) and baseline_rmse > 0 else float('nan')
+                                bias24 = float(np.mean(err))
+                                mid = _get_latest_model_id(conn) or 0
+                                dbmod.upsert_health_metrics(conn, dev_id, end_utc, mid, rmse24, mape24, baseline_rmse, rmse_ratio, bias24)
+                    except Exception:
+                        pass
+    except asyncio.CancelledError:
+        return
+
+
+async def _backfill_predictions_range(conn: sqlite3.Connection, device_id: int, device_tz: str, start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> None:
+    try:
+        model, scaler = load_artifacts(MODEL_PATH, SCALER_PATH)
+        win = get_model_window_size(model)
+    except Exception:
+        return
+    hours = pd.date_range(start=start_utc, end=end_utc, freq='H')
+    for h in hours:
+        exist = dbmod.fetch_predictions_range(conn, device_id, h, h)
+        if not exist.empty:
+            continue
+        window_end = h - pd.Timedelta(hours=1)
+        window_start = window_end - pd.Timedelta(hours=win - 1)
+        if window_end < window_start:
+            continue
+        await _ensure_window_filled(conn, device_id, device_tz, window_start, window_end)
+        win_hist = dbmod.fetch_readings_range(conn, device_id, window_start, window_end)
+        if win_hist.empty or len(win_hist) < win:
+            continue
+        try:
+            pred_df = forecast_next_hours_general(win_hist, model, scaler, window_size=win, steps=1, device_id=device_id, device_tz=device_tz)
+            y_pred = float(pred_df['y_pred'].iloc[0])
+            mid = _get_latest_model_id(conn) or 0
+            dbmod.insert_prediction(conn, device_id, h, mid, y_pred)
+        except Exception:
+            continue
 
 
 @app.on_event("shutdown")
@@ -440,6 +702,13 @@ async def shutdown_event():
         task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+    daily = STATE.get("daily_task")
+    if daily is not None:
+        daily.cancel()
+        try:
+            await daily
         except asyncio.CancelledError:
             pass
 

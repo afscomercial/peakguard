@@ -96,6 +96,36 @@ def migrate(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id INTEGER NOT NULL,
+            ts_utc TEXT NOT NULL,
+            model_id INTEGER NOT NULL,
+            y_pred REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(device_id, ts_utc, model_id)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS health_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id INTEGER NOT NULL,
+            ts_utc TEXT NOT NULL,
+            model_id INTEGER NOT NULL,
+            rmse_24h REAL,
+            mape_24h REAL,
+            baseline_rmse_24h REAL,
+            rmse_ratio_24h REAL,
+            bias_24h REAL,
+            created_at TEXT NOT NULL,
+            UNIQUE(device_id, ts_utc, model_id)
+        );
+        """
+    )
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
@@ -228,6 +258,81 @@ def get_model_with_results(conn: sqlite3.Connection, model_id: int) -> Optional[
         "loss_history": loss,
         "rmse_history": rmse,
         "test_plot": plot,
+    }
+
+
+def insert_prediction(conn: sqlite3.Connection, device_id: int, ts_utc: pd.Timestamp, model_id: int, y_pred: float) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO predictions(device_id, ts_utc, model_id, y_pred, created_at) VALUES(?, ?, ?, ?, ?)",
+        (device_id, ts_utc.strftime("%Y-%m-%d %H:%M:%S"), model_id, float(y_pred), pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def fetch_latest_prediction(conn: sqlite3.Connection, device_id: int) -> Optional[Dict]:
+    cur = conn.execute(
+        "SELECT ts_utc, model_id, y_pred FROM predictions WHERE device_id=? ORDER BY ts_utc DESC LIMIT 1",
+        (device_id,),
+    )
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"ts_utc": r[0], "model_id": int(r[1]), "y_pred": float(r[2])}
+
+
+def fetch_predictions_range(conn: sqlite3.Connection, device_id: int, start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DataFrame:
+    cur = conn.execute(
+        """
+        SELECT ts_utc, model_id, y_pred
+        FROM predictions
+        WHERE device_id=? AND ts_utc BETWEEN ? AND ?
+        ORDER BY ts_utc ASC
+        """,
+        (device_id, start_utc.strftime("%Y-%m-%d %H:%M:%S"), end_utc.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(index=pd.DatetimeIndex([], name="timestamp"), columns=["model_id", "y_pred"])
+    idx = pd.to_datetime([r[0] for r in rows])
+    df = pd.DataFrame({"timestamp": idx, "model_id": [int(r[1]) for r in rows], "y_pred": [float(r[2]) for r in rows]}).set_index("timestamp")
+    return df
+
+
+def upsert_health_metrics(
+    conn: sqlite3.Connection,
+    device_id: int,
+    ts_utc: pd.Timestamp,
+    model_id: int,
+    rmse_24h: float,
+    mape_24h: float,
+    baseline_rmse_24h: float,
+    rmse_ratio_24h: float,
+    bias_24h: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO health_metrics(device_id, ts_utc, model_id, rmse_24h, mape_24h, baseline_rmse_24h, rmse_ratio_24h, bias_24h, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (device_id, ts_utc.strftime("%Y-%m-%d %H:%M:%S"), model_id, rmse_24h, mape_24h, baseline_rmse_24h, rmse_ratio_24h, bias_24h, pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def fetch_latest_health(conn: sqlite3.Connection, device_id: int) -> Optional[Dict]:
+    cur = conn.execute(
+        "SELECT ts_utc, model_id, rmse_24h, mape_24h, baseline_rmse_24h, rmse_ratio_24h, bias_24h FROM health_metrics WHERE device_id=? ORDER BY ts_utc DESC LIMIT 1",
+        (device_id,),
+    )
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {
+        "ts_utc": r[0],
+        "model_id": int(r[1]),
+        "rmse_24h": float(r[2]) if r[2] is not None else None,
+        "mape_24h": float(r[3]) if r[3] is not None else None,
+        "baseline_rmse_24h": float(r[4]) if r[4] is not None else None,
+        "rmse_ratio_24h": float(r[5]) if r[5] is not None else None,
+        "bias_24h": float(r[6]) if r[6] is not None else None,
     }
 
 

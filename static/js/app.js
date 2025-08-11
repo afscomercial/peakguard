@@ -3,6 +3,13 @@ async function fetchJSON(url, opts={}){ const r = await fetch(url, opts); if(!r.
 
 function nowMs(){ return Date.now(); }
 
+function fmt(val, digits=3){
+  if(val === null || val === undefined) return '-';
+  const n = Number(val);
+  if(Number.isNaN(n) || !Number.isFinite(n)) return '-';
+  return n.toFixed(digits);
+}
+
 function getSelectedDeviceId(){
   const sel = document.getElementById('device-selector');
   return sel ? parseInt(sel.value, 10) : 1;
@@ -91,6 +98,9 @@ async function refreshForecast(){
     const traceFut  = { x: xForecast,  y: yForecast,  mode: 'lines+markers', name: 'Forecast (+1h)', line:{color:'#2ea043', width:3}, marker:{color:'#2ea043', size:8} };
 
     Plotly.newPlot('forecast-plot', [traceHist, traceFut], baseLayout(), {responsive:true});
+
+    // Refresh last-24h health metrics panel
+    await refreshHealth();
   }catch(e){ console.error(e); }
 }
 
@@ -111,16 +121,50 @@ async function init(){
   await refreshLive();
   await refreshForecast();
   await refreshDiagnostics();
+  await refreshHealth();
   // Refresh every hour (3600s); for demo, use shorter interval like 10s
   const HOUR_MS = 3600 * 1000;
   setInterval(refreshLive, HOUR_MS);
   setInterval(refreshForecast, HOUR_MS);
   setInterval(refreshDiagnostics, HOUR_MS);
+  setInterval(refreshHealth, HOUR_MS);
   document.getElementById('device-selector').addEventListener('change', async ()=>{
     await refreshLive();
     await refreshForecast();
     await refreshDiagnostics();
+    await refreshHealth();
   });
 }
 
 window.addEventListener('DOMContentLoaded', init);
+
+async function refreshHealth(){
+  try{
+    const deviceId = getSelectedDeviceId();
+    // Use pre-computed daily metrics if any; otherwise compute on-demand
+    const latest = await fetchJSON(`/api/metrics/health?deviceId=${deviceId}`);
+    let metrics;
+    if(latest && latest.rmse_24h != null){
+      metrics = latest;
+    }else{
+      const cmp = await fetchJSON(`/api/metrics/compare-24h?deviceId=${deviceId}`);
+      metrics = cmp.metrics || {};
+    }
+    const container = document.getElementById('health-status');
+    if(!metrics || Object.keys(metrics).length === 0){
+      container.innerHTML = '<div class="grid"><div class="cell">No 24h health metrics available yet.</div></div>';
+      return;
+    }
+    const statusColor = metrics.status === 'green' ? '#2ea043' : '#f85149';
+    container.innerHTML = `
+      <div class="grid">
+        <div class="cell"><div class="label">RMSE 24h</div><div class="value">${fmt(metrics.rmse_24h)}</div></div>
+        <div class="cell"><div class="label">MAPE 24h</div><div class="value">${fmt(metrics.mape_24h)}</div></div>
+        <div class="cell"><div class="label">Baseline RMSE 24h</div><div class="value">${fmt(metrics.baseline_rmse_24h)}</div></div>
+        <div class="cell"><div class="label">RMSE Ratio</div><div class="value">${fmt(metrics.rmse_ratio_24h)}</div></div>
+        <div class="cell"><div class="label">Bias 24h</div><div class="value">${fmt(metrics.bias_24h)}</div></div>
+        <div class="cell"><div class="label">Status</div><div class="value status" style="color:${statusColor}">${metrics.status === 'green' ? 'Healthy' : 'Attention'}</div></div>
+      </div>
+    `;
+  }catch(e){ console.error(e); }
+}
