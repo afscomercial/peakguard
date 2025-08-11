@@ -3,6 +3,9 @@ import os
 import asyncio
 import sqlite3
 from fastapi import FastAPI, Request
+from fastapi import UploadFile, File, Form, HTTPException
+import urllib.request
+import urllib.error
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -26,7 +29,7 @@ ARTIFACTS_DIR = os.path.join(BASE_DIR, 'artifacts')
 LATEST_ARTIFACTS_DIR = os.path.join(ARTIFACTS_DIR, 'latest')
 MODEL_PATH = os.path.join(LATEST_ARTIFACTS_DIR, 'gru_energy_forecaster.keras')
 SCALER_PATH = os.path.join(LATEST_ARTIFACTS_DIR, 'series_minmax_scaler.pkl')
-
+REMOTE_SYNC_URL = os.environ.get('REMOTE_SYNC_URL') or "https://peakguard-production.up.railway.app"
 app = FastAPI(title="PeakGuard API")
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -142,6 +145,115 @@ async def admin_generate(req: AdminGenerateRequest):
             },
             "row_count": int(len(df)),
         }
+
+@app.get("/api/admin/models/sync", response_class=JSONResponse)
+async def admin_models_sync():
+    """Synchronize model_results from local (artifacts + local DB) to remote DB.
+    This endpoint is meant to be called on the remote server from the local machine via curl.
+    It compares model IDs present in the server DB with those from a provided metrics payload
+    and inserts any missing rows.
+    Usage (from local):
+      curl -X POST <server>/api/admin/models/push --data @metrics.json
+    For simplicity per request, this GET will just report what's missing.
+    """
+    with dbmod.get_conn() as conn:
+        server_ids = set(dbmod.list_model_ids(conn))
+    return {"server_model_ids": sorted(list(server_ids))}
+
+@app.post("/api/admin/models/push", response_class=JSONResponse)
+async def admin_models_push(payload: dict):
+    """Push missing model rows to remote DB.
+    Body JSON format:
+    {
+      "models": [
+        {"id": 1, "created_at": "YYYY-mm-dd HH:MM:SS", "artifact_dir": "artifacts/versions/...", "notes": "...",
+         "loss_history": {"train": [...], "val": [...]}, "rmse_history": [...], "test_plot": {"y_true": [...], "y_pred": [...]}}
+      ]
+    }
+    """
+    if not isinstance(payload, dict) or "models" not in payload:
+        raise HTTPException(status_code=400, detail="Invalid payload; expected { models: [...] }")
+    models = payload["models"]
+    if not isinstance(models, list):
+        raise HTTPException(status_code=400, detail="models must be a list")
+
+    inserted: list[int] = []
+    updated: list[int] = []
+    with dbmod.get_conn() as conn:
+        existing = set(dbmod.list_model_ids(conn))
+        for m in models:
+            mid = int(m.get("id"))
+            created_at = m.get("created_at") or pd.Timestamp.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            artifact_dir = m.get("artifact_dir") or os.path.join(ARTIFACTS_DIR, 'latest')
+            notes = m.get("notes")
+            dbmod.upsert_model_with_id(conn, mid, created_at, artifact_dir, notes)
+            loss_hist = m.get('loss_history') or {"train": [], "val": []}
+            if not isinstance(loss_hist, dict):
+                loss_hist = {"train": [], "val": loss_hist}
+            rmse_hist = m.get('rmse_history') or []
+            test_plot = m.get('test_plot') or {"y_true": [], "y_pred": []}
+            dbmod.save_model_results(conn, mid, loss_history=loss_hist, rmse_history=rmse_hist, test_plot=test_plot)
+            (updated if mid in existing else inserted).append(mid)
+
+    return {"inserted": inserted, "updated": updated}
+
+
+@app.get("/api/admin/models/sync-local-to-remote", response_class=JSONResponse)
+async def admin_models_sync_local_to_remote():
+    """Collect all local models + metrics and push missing rows to a remote server.
+    Remote base URL is read from REMOTE_SYNC_URL env var (e.g., https://peakguard-production.up.railway.app).
+    """
+    if not REMOTE_SYNC_URL:
+        raise HTTPException(status_code=400, detail="REMOTE_SYNC_URL is not set")
+    # Build local payload
+    models_payload = []
+    with dbmod.get_conn() as conn:
+        cur = conn.execute("SELECT id, created_at, artifact_dir, notes FROM models ORDER BY id ASC")
+        rows = cur.fetchall()
+        for mid, created_at, artifact_dir, notes in rows:
+            cur2 = conn.execute("SELECT loss_history, rmse_history, test_plot FROM model_results WHERE model_id=?", (mid,))
+            r = cur2.fetchone()
+            loss = json.loads(r[0]) if r and r[0] else {"train": [], "val": []}
+            rmse = json.loads(r[1]) if r and r[1] else []
+            plot = json.loads(r[2]) if r and r[2] else {"y_true": [], "y_pred": []}
+            models_payload.append({
+                "id": int(mid),
+                "created_at": created_at,
+                "artifact_dir": artifact_dir,
+                "notes": notes,
+                "loss_history": loss,
+                "rmse_history": rmse,
+                "test_plot": plot,
+            })
+    payload = {"models": models_payload}
+    # Query remote existing IDs
+    try:
+        with urllib.request.urlopen(f"{REMOTE_SYNC_URL}/api/admin/models/sync", timeout=20) as resp:
+            body = resp.read()
+            remote_info = json.loads(body.decode('utf-8'))
+            remote_ids = set(remote_info.get('server_model_ids', []))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach remote sync endpoint: {e}")
+    # Filter to only models not present on remote
+    to_push = [m for m in models_payload if int(m['id']) not in remote_ids]
+    if not to_push:
+        return {"pushed": [], "skipped": sorted(list(remote_ids)), "message": "Remote already up to date"}
+    try:
+        data = json.dumps({"models": to_push}).encode('utf-8')
+        req = urllib.request.Request(
+            url=f"{REMOTE_SYNC_URL}/api/admin/models/push",
+            data=data,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            out = json.loads(resp.read().decode('utf-8'))
+        return {"pushed_ids": [m['id'] for m in to_push], "remote_result": out}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+        raise HTTPException(status_code=502, detail=f"Remote push failed: {e} {detail}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Remote push error: {e}")
 
 @app.post("/api/admin/generate-range", response_class=JSONResponse)
 async def admin_generate_range(req: AdminGenerateRangeRequest):
