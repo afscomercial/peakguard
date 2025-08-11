@@ -6,6 +6,10 @@ body { margin:0; background: var(--bg); color: var(--fg); font-family: -apple-sy
 h1 { font-size: 1.6rem; margin: 0 0 1rem; }
 .panel { background: var(--panel); border: 1px solid #30363d; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
 .plot { width: 100%; height: 420px; }
-ul#live-list { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill,minmax(180px,1fr)); gap: .5rem; }
-ul#live-list li { background: #0b1220; border: 1px solid #223450; border-radius: 6px; padding: .5rem; color: var(--muted); }
+/* Scrollable one-item-per-line list */
+ul#live-list { list-style: none; padding: 0; margin: 0; max-height: 320px; overflow-y: auto; display: block; }
+ul#live-list li { background: #0b1220; border: 1px solid #223450; border-radius: 6px; padding: .5rem .75rem; color: var(--muted); margin-bottom: .5rem; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.row .ts { color: var(--fg); font-variant-numeric: tabular-nums; }
+.row .val { color: var(--accent); font-weight: 600; }
 @media (max-width: 640px){ .plot { height: 360px; } }
